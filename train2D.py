@@ -24,24 +24,42 @@ Differences from the published train2D.py, all marked `# CHANGED` below:
      bled across the septa and merged neighbouring tubules). `--loss dice_ce` restores
      the published setting. cfg.val_loss_key / save_frequency / early_stop_patience are
      now actually passed to the trainer.
+  9. `--iters 0` runs the supervised segmentation only: no registration pre-training, no
+     quality assessment, no registration test. Use it when the question is "how good is
+     the mask", since the iterative stage has so far only subtracted from it.
+ 10. Logging. Every evaluation is teed from tensorboard into `<output>/metrics.csv`
+     (long format: stage, split, epoch, metric, value), the final numbers plus the whole
+     configuration go to `<output>/run_summary.json`, and one row per run is appended to
+     `--runs-index` (default ./runs_index.csv) so runs can be compared without opening
+     tensorboard. Segmentation evaluation now also reports precision, recall,
+     predicted/true foreground fraction and tp/fp/fn, so dice can be pooled over a whole
+     split instead of averaged per patch.
+ 11. `--probe-unlabeled` scores the held-out donors in `unlabeled_test/` label-free
+     (predicted foreground fraction, left-right flip consistency, confidence), which is
+     the only read available on generalization to unseen cases.
 
 Run `python train2D.py --help` for the options, `--quick` for a smoke test.
 """
 
 import argparse
+import csv
 import glob
+import json
 import os
 import shutil
+import time
 
 import numpy as np
 import scipy.io as sio
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data.dataloader import DataLoader
 
 from snmi.core import Trainer
 from snmi._custom import SegRegDataset
 from snmi.utils import augmentation_methods as A, loss_fuctions as LF, process_methods as P, utils as U
+from snmi.utils.log_writers import LogWriterTensorboard
 
 from snmi.nets.net_reg import MrReg
 from snmi.nets.unet2D import Unet2D
@@ -86,6 +104,16 @@ def parse_args(argv=None):
                     help='disable the gamma/noise jitter that comes with --aug dihedral')
     ap.add_argument('--early-stop-patience', type=int, default=0,
                     help='stop pre-training after N evaluations without improvement (0 = off)')
+    ap.add_argument('--run-id', default=None,
+                    help='name of this run in metrics.csv / runs_index.csv (default: folder + timestamp)')
+    ap.add_argument('--runs-index', default=os.path.join(HERE, 'runs_index.csv'),
+                    help='CSV accumulating one row per run, for cross-run comparison')
+    ap.add_argument('--note', default='', help='free-text note stored with the run')
+    ap.add_argument('--probe-unlabeled', dest='probe_unlabeled', action='store_true', default=True,
+                    help='label-free evaluation on unlabeled_test/ (default: on)')
+    ap.add_argument('--no-probe-unlabeled', dest='probe_unlabeled', action='store_false')
+    ap.add_argument('--probe-max', type=int, default=400,
+                    help='cap on unlabeled_test patches used by the probe (0 = all)')
     ap.add_argument('--batch-size', type=int, default=5)
     ap.add_argument('--max-targets', type=int, default=400,
                     help='cap on unlabeled targets kept for pseudo-labeling (0 = all)')
@@ -99,8 +127,11 @@ def parse_args(argv=None):
     args = ap.parse_args(argv)
     if args.quick:
         args.pre_seg_ep, args.pre_reg_ep = 2, 2
-        args.seg_ep, args.reg_ep, args.iters = 2, 2, 1
+        args.seg_ep, args.reg_ep = 2, 2
+        # cap instead of overwrite, so `--quick --iters 0` stays a 0-iteration run
+        args.iters = min(args.iters, 1)
         args.max_targets, args.max_reg_pairs, args.num_assessment = 20, 40, 2
+        args.probe_max = min(args.probe_max or 20, 20)
     return args
 
 
@@ -121,6 +152,120 @@ def build_seg_loss(name):
     return {LF.SoftDice(ignore_background=False): 0.5,
             LF.BoundarySeparationCrossEntropy(w0=args.boundary_w0,
                                               sigma=args.boundary_sigma): 0.5}
+
+
+RUN_ID = args.run_id or f"{os.path.basename(os.path.normpath(args.output_path))}-{time.strftime('%Y%m%d-%H%M%S')}"
+METRICS_CSV = os.path.join(args.output_path, 'metrics.csv')
+METRIC_FIELDS = ('run_id', 'stage', 'split', 'epoch', 'metric', 'value')
+
+
+def log_metrics(stage, split, epoch, values):
+    """Append rows to <output>/metrics.csv in long format."""
+    rows = []
+    for k, v in (values or {}).items():
+        if k in ('image', 'name') or v is None:
+            continue
+        v = np.asarray(v, dtype=object) if isinstance(v, dict) else np.asarray(v)
+        if v.dtype == object or v.ndim > 2:
+            continue
+        rows.append({'run_id': RUN_ID, 'stage': stage, 'split': split, 'epoch': int(epoch),
+                     'metric': k, 'value': float(np.mean(np.asarray(v, dtype=np.float64)))})
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(METRICS_CSV), exist_ok=True)
+    new = not os.path.isfile(METRICS_CSV)
+    with open(METRICS_CSV, 'a', newline='', encoding='utf-8') as fh:
+        w = csv.DictWriter(fh, METRIC_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerows(rows)
+
+
+def pooled(results, keys=('tp', 'fp', 'fn')):
+    """Dice / precision / recall pooled over every pixel of a split.
+
+    Patch-averaged dice is dominated by patches with little foreground (it correlated
+    0.82 with patch foreground in the first runs), so the pooled version is the one to
+    compare across runs and splits.
+    """
+    if not all(k in results for k in keys):
+        return {}
+    tp, fp, fn = (float(np.sum(results[k])) for k in keys)
+    eps = 1e-9
+    return {'dice_pooled': 2 * tp / (2 * tp + fp + fn + eps),
+            'precision_pooled': tp / (tp + fp + eps),
+            'recall_pooled': tp / (tp + fn + eps)}
+
+
+class TeeWriter:
+    """Tensorboard writer that also appends every scalar to metrics.csv.
+
+    Trainer calls `log_writer(f'{output}/log/{timestamp}/{split}')`, so stage and split
+    are recovered from that path.
+    """
+
+    def __init__(self, log_path):
+        self.tb = LogWriterTensorboard(log_path)
+        rel = os.path.relpath(log_path, args.output_path).replace('\\', '/')
+        parts = rel.split('/')
+        self.split = parts[-1]
+        self.stage = parts[0] if parts[0] != 'log' else 'run'
+        if len(parts) > 2 and parts[1] != 'log':
+            self.stage = '/'.join(parts[:2])
+
+    def write_scalar(self, eval_dict, epoch, tag=''):
+        self.tb.write_scalar(eval_dict, epoch, tag)
+        log_metrics(self.stage, self.split, epoch, eval_dict)
+
+    def write_image(self, img_dict, epoch, tag=''):
+        self.tb.write_image(img_dict, epoch, tag)
+
+    def write_text(self, text, epoch, tag=''):
+        self.tb.write_text(text, epoch, tag)
+
+    def write_graph(self, net, inp):
+        self.tb.write_graph(net, inp)
+
+
+@torch.no_grad()
+def probe_unlabeled(net, files, device, tag):
+    """Label-free checks on donors that training never saw.
+
+    No ground truth exists here, so this measures whether the model stays sane:
+      pred_fg          predicted foreground fraction (compare with the labeled ~0.5;
+                       collapse to 0 or 1 is the failure to catch)
+      flip_consistency dice between the prediction and the prediction of the mirrored
+                       patch, mirrored back. Pure self-consistency, no labels needed.
+      confidence       mean max(p, 1-p); low values mean the model is guessing.
+    """
+    if not files:
+        return {}
+    net.eval()
+    fg, cons, conf = [], [], []
+    for f in files:
+        img = U.load_file(f)
+        img = P.min_max(img)
+        x = torch.from_numpy(img[None, None].astype(np.float32)).to(device)
+        p = F.softmax(net(x), 1)[0, 1]
+        pf = torch.flip(F.softmax(net(torch.flip(x, [-1])), 1)[0, 1], [-1])
+        a, b = (p > 0.5).float(), (pf > 0.5).float()
+        total = float(a.sum() + b.sum())
+        fg.append(float(a.mean()))
+        # both empty is perfectly consistent; the collapse itself shows up in pred_fg
+        cons.append(1.0 if total == 0 else
+                    float((2 * (a * b).sum() / total).clamp(0, 1)))
+        conf.append(float(torch.maximum(p, 1 - p).mean()))
+    fg, cons, conf = np.array(fg), np.array(cons), np.array(conf)
+    out = {'n_patches': float(len(files)),
+           'pred_fg_mean': float(fg.mean()), 'pred_fg_sd': float(fg.std()),
+           'pred_fg_p10': float(np.percentile(fg, 10)), 'pred_fg_p90': float(np.percentile(fg, 90)),
+           'empty_patches': float(np.mean(fg < 0.01)), 'saturated_patches': float(np.mean(fg > 0.95)),
+           'flip_consistency_mean': float(cons.mean()), 'flip_consistency_p10': float(np.percentile(cons, 10)),
+           'confidence_mean': float(conf.mean())}
+    print(f'  unlabeled probe [{tag}] n={len(files)}  pred_fg={out["pred_fg_mean"]:.3f}'
+          f'+-{out["pred_fg_sd"]:.3f}  flip_consistency={out["flip_consistency_mean"]:.3f}'
+          f'  confidence={out["confidence_mean"]:.3f}')
+    return out
 
 
 def pick_device(choice):
@@ -144,13 +289,13 @@ class cfg:
 
     test_only = args.test_only          # CHANGED: train by default
     test_pre_seg = True
-    test_pre_reg = True                 # CHANGED: source_test/ exists, so reg can be tested
+    test_pre_reg = args.iters > 0       # CHANGED: only when the loop needs registration
     test_seg = True
-    test_reg = True                     # CHANGED
+    test_reg = args.iters > 0           # CHANGED
 
     # pre_training parameters
     pre_train_seg = True
-    pre_train_reg = True                # CHANGED: no external pre_reg checkpoint exists
+    pre_train_reg = args.iters > 0      # CHANGED: no external pre_reg checkpoint exists
     pre_seg_ep = args.pre_seg_ep
     pre_seg_lr = 1e-4
     pre_seg_eval_frequency = max(1, args.pre_seg_ep // 20)   # CHANGED: scales with the schedule
@@ -170,6 +315,9 @@ class cfg:
     # iterative
     iters_start = 0
     iters = args.iters
+    # CHANGED: with --iters 0 nothing needs the registration branch, so skip ~40 min of
+    # pre-training plus the 250-pair registration test.
+    use_reg = args.iters > 0
     threshold_dice = 0.9
     threshold_dice_min = 0.2
     num_assessment = args.num_assessment
@@ -220,9 +368,9 @@ class cfg:
 
 
 # Data ------------------------------------------------------------------------
-def list_split(name):
+def list_split(name, required=True):
     files = sorted(glob.glob(os.path.join(cfg.data_path, name, '*' + cfg.img_suffix)))
-    if not files:
+    if not files and required:
         raise SystemExit(f'No "*{cfg.img_suffix}" in {os.path.join(cfg.data_path, name)}.\n'
                          f'  Build the dataset first: python prepare_data_2d.py')
     return files
@@ -259,7 +407,12 @@ rng = np.random.RandomState(args.seed)
 train = list_split('train')
 valid = list_split('valid')
 test = list_split('test')
-source_test = list_split('source_test')
+source_test = list_split('source_test', required=cfg.use_reg)
+# CHANGED: donors held out of training entirely; no labels, probe only.
+unlabeled_test = list_split('unlabeled_test', required=False)
+if args.probe_max and len(unlabeled_test) > args.probe_max:
+    unlabeled_test = sorted(np.random.RandomState(args.seed + 7).choice(
+        unlabeled_test, size=args.probe_max, replace=False).tolist())
 
 # CHANGED: labeled vs. unlabeled by prefix instead of slicing a shuffled list.
 source = [f for f in train if os.path.basename(f).startswith('src_')]
@@ -276,10 +429,27 @@ print(f'Dataset   {cfg.data_path}')
 print(f'  train   {len(source)} labeled source + {len(target_train)} unlabeled target patches'
       + (f' (capped from {len(train) - len(source)})' if args.max_targets else ''))
 print(f'  valid   {len(target_valid)}   test {len(target_test)}   '
-      f'source_test {len(source_test)}')
+      f'source_test {len(source_test)}   unlabeled_test {len(unlabeled_test)}')
 print(f'Training  loss={args.loss}  aug={args.aug}'
       + (f' (rate {args.aug_rate}, jitter {not args.no_jitter})' if args.aug != 'none' else '')
-      + f'  pre_seg_ep={cfg.pre_seg_ep} seg_ep={cfg.seg_ep} iters={cfg.iters}')
+      + f'  pre_seg_ep={cfg.pre_seg_ep} seg_ep={cfg.seg_ep} iters={cfg.iters}'
+      + ('' if cfg.use_reg else '  [registration branch skipped: --iters 0]'))
+print(f'Run id    {RUN_ID}')
+
+dataset_info = {'data_path': cfg.data_path, 'source': len(source),
+                'target_train': len(target_train), 'valid': len(target_valid),
+                'test': len(target_test), 'source_test': len(source_test),
+                'unlabeled_test': len(unlabeled_test)}
+try:
+    with open(os.path.join(cfg.data_path, 'dataset_report.json'), encoding='utf-8') as fh:
+        _rep = json.load(fh)
+    dataset_info['split_mode'] = _rep['labeled_patches']['split_mode']
+    dataset_info['block_size'] = _rep['labeled_patches'].get('block_size')
+    dataset_info['fg_density'] = _rep['labeled_patches']['foreground_density_per_split']
+    dataset_info['excluded_images'] = _rep['inputs']['excluded_count'] if 'inputs' in _rep else None
+    dataset_info['unlabeled_test_donors'] = _rep['unlabeled'].get('donors_heldout')
+except (OSError, KeyError, json.JSONDecodeError):
+    pass
 
 # source check
 source_check_path = cfg.output_path + '/source_start'
@@ -320,11 +490,13 @@ seg_train_set = SegRegDataset([], source, cfg.source_key, cfg.target_key, [cfg.i
 seg_train_loader = DataLoader(seg_train_set, batch_size=cfg.train_batch_size, shuffle=True)
 
 # CHANGED: registration pre-training pairs drawn from source + (capped) targets.
-reg_pool = subsample_by_case(source + target_train, args.max_reg_pairs, rng)
-reg_target_list = list(reg_pool)
-rng.shuffle(reg_target_list)
-reg_train_set = SegRegDataset(reg_pool, reg_target_list, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre)
-reg_train_loader = DataLoader(reg_train_set, batch_size=cfg.train_batch_size, shuffle=True)
+reg_train_loader = None
+if cfg.use_reg:
+    reg_pool = subsample_by_case(source + target_train, args.max_reg_pairs, rng)
+    reg_target_list = list(reg_pool)
+    rng.shuffle(reg_target_list)
+    reg_train_set = SegRegDataset(reg_pool, reg_target_list, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre)
+    reg_train_loader = DataLoader(reg_train_set, batch_size=cfg.train_batch_size, shuffle=True)
 
 valid_set = SegRegDataset(source, target_valid, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre)
 valid_loader = DataLoader(valid_set, batch_size=cfg.eval_batch_size)
@@ -334,8 +506,8 @@ pre_model_seg = JointSegModel(net_seg, pre_opt_seg, cfg.img_suffix, cfg.lab_suff
 pre_model_reg = JointRegModel(net_reg, pre_opt_reg, cfg.img_suffix, cfg.source_key, cfg.target_key, lab_suffix=cfg.lab_suffix, weight_suffix=cfg.weight_suffix,
                     loss_functions=cfg.reg_loss, disp_loss_functions=cfg.disp_loss, lab_loss_functions=None, device=device)
 
-pre_trainer_seg = Trainer(pre_model_seg)
-pre_trainer_reg = Trainer(pre_model_reg)
+pre_trainer_seg = Trainer(pre_model_seg, log_writer=TeeWriter)   # CHANGED: tensorboard + CSV
+pre_trainer_reg = Trainer(pre_model_reg, log_writer=TeeWriter)
 
 if not cfg.test_only :
     if cfg.pre_train_seg:
@@ -365,23 +537,32 @@ model_seg = JointSegModel(net_seg, opt_seg, cfg.img_suffix, cfg.lab_suffix, cfg.
 model_reg = JointRegModel(net_reg, opt_reg, cfg.img_suffix, cfg.source_key, cfg.target_key, lab_suffix=cfg.lab_suffix, weight_suffix=cfg.weight_suffix,
                     loss_functions=cfg.reg_loss, disp_loss_functions=cfg.disp_loss, lab_loss_functions=cfg.lab_loss, device=device)
 
-trainer_seg = Trainer(model_seg)
-trainer_reg = Trainer(model_reg)
+trainer_seg = Trainer(model_seg, log_writer=TeeWriter)          # CHANGED
+trainer_reg = Trainer(model_reg, log_writer=TeeWriter)
 
 # Assessment initialization
 count_good = 0
 assessment = QualityAssessment(model_seg, model_reg)
 ass_pre = {cfg.img_suffix: [P.min_max, P.ExpandDim(0), P.ToTensor(0)],
             cfg.lab_suffix: [P.ToTensor(0)]}
-target_set = SegRegDataset(source, target_train, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix], ass_pre, is_assessment=True, num_assessment=cfg.num_assessment)
+target_set = None
+if cfg.use_reg:   # CHANGED: the assessment set is only needed by the iterative loop
+    target_set = SegRegDataset(source, target_train, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix], ass_pre, is_assessment=True, num_assessment=cfg.num_assessment)
+
+summary = {'run_id': RUN_ID, 'args': vars(args), 'dataset': dataset_info,
+           'device': str(device), 'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+           'metrics': {}}
+t_start = time.time()
+
 if cfg.iters_start == 0:
     # Restore pre-trained model   # CHANGED: both branches now read this run's output
     ckpt_seg = require_ckpt(cfg.output_path + '/pre_seg/ckpt/model_best.pt',
                             'Run without --test-only first to pre-train the segmentation net.')
-    ckpt_reg = require_ckpt(cfg.output_path + '/pre_reg/ckpt/model_final.pt',
-                            'Run without --test-only first to pre-train the registration net.')
     net_seg.load_state_dict(ckpt_seg['net0'])
-    net_reg.load_state_dict(ckpt_reg['net0'])
+    if cfg.use_reg:
+        ckpt_reg = require_ckpt(cfg.output_path + '/pre_reg/ckpt/model_final.pt',
+                                'Run without --test-only first to pre-train the registration net.')
+        net_reg.load_state_dict(ckpt_reg['net0'])
     # freeze encoder and first 3 decoder of registration model
     if cfg.freeze_reg:
         net_reg.enc.requires_grad_(False)
@@ -397,8 +578,30 @@ if cfg.iters_start == 0:
         seg_test_loader = DataLoader(seg_test_set, batch_size=cfg.eval_batch_size)
         seg_results = trainer_seg.test(seg_test_loader, cfg.output_path + '/pre_seg', desc=f'Pre Test Seg: ', log_image=cfg.seg_log_validation_image)
         sio.savemat(f'{cfg.output_path}/pre_seg/test_results.mat', seg_results)
+        # CHANGED: pooled metrics + CSV, and the validation set re-scored with the
+        # restored best checkpoint so valid and test are directly comparable.
+        seg_pooled = pooled(seg_results)
+        valid_results = trainer_seg.eval(valid_loader, desc='Pre Eval Valid: ')
+        valid_pooled = pooled(valid_results)
+        log_metrics('pre_seg', 'test', 0, {**U.dict_mean(seg_results), **seg_pooled})
+        log_metrics('pre_seg', 'valid_best', 0, {**U.dict_mean(valid_results), **valid_pooled})
+        summary['metrics']['pre_seg_test'] = {**{k: float(np.mean(v)) for k, v in U.dict_mean(seg_results).items()}, **seg_pooled}
+        summary['metrics']['pre_seg_valid'] = {**{k: float(np.mean(v)) for k, v in U.dict_mean(valid_results).items()}, **valid_pooled}
+        print(f'  pre_seg  test  dice(patch)={np.mean(seg_results["dice"]):.4f} '
+              f'dice(pooled)={seg_pooled["dice_pooled"]:.4f} '
+              f'prec={seg_pooled["precision_pooled"]:.4f} rec={seg_pooled["recall_pooled"]:.4f}')
+        print(f'  pre_seg  valid dice(patch)={np.mean(valid_results["dice"]):.4f} '
+              f'dice(pooled)={valid_pooled["dice_pooled"]:.4f}')
         with open(f'{cfg.output_path}/final_test_results.txt', 'a+') as f:
             f.write(f'  Seg - {U.dict_to_str(seg_results)}\n')
+            f.write(f'  Seg pooled - ' + '  '.join(f'{k}: {v:.4f}' for k, v in seg_pooled.items()) + '\n')
+        if args.probe_unlabeled and unlabeled_test:
+            probe = probe_unlabeled(net_seg, unlabeled_test, device, 'pre_seg')
+            log_metrics('pre_seg', 'unlabeled_test', 0, probe)
+            summary['metrics']['pre_seg_unlabeled'] = probe
+            with open(f'{cfg.output_path}/final_test_results.txt', 'a+') as f:
+                f.write('  Seg unlabeled probe - '
+                        + '  '.join(f'{k}: {v:.4f}' for k, v in probe.items()) + '\n')
     if cfg.pre_train_reg or cfg.test_pre_reg:
         reg_test_set = SegRegDataset(sorted(source_test), sorted(target_test*len(source_test)), cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre)
         reg_test_loader = DataLoader(reg_test_set, batch_size=len(source_test))
@@ -410,7 +613,7 @@ if cfg.iters_start == 0:
     reg_results = None
 
     # generate assessed data
-    if not cfg.test_only:
+    if not cfg.test_only and cfg.use_reg:   # CHANGED: skipped entirely when --iters 0
         count_good = assessment.assessment(target_set, cfg.output_path+'/assessed_data', 
                                 cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix,
                                 [0,1], cfg.threshold_dice, cfg.threshold_dice_min, cfg.min_good, target_key=cfg.target_key)
@@ -492,6 +695,18 @@ for it_idx in range(cfg.iters_start, cfg.iters):
         sio.savemat(f'{it_path_seg}/test_results.mat', it_seg_results)
         with open(f'{it_path_seg}/test_results.txt', 'a+') as f:
             f.write(U.dict_to_str(it_seg_results) + '\n')
+        # CHANGED: pooled metrics, CSV and the unlabeled probe, per iteration
+        it_pooled = pooled(it_seg_results)
+        log_metrics(f'iter-{it_idx}/seg', 'test', it_idx, {**U.dict_mean(it_seg_results), **it_pooled})
+        summary['metrics'][f'iter{it_idx}_seg_test'] = {
+            **{k: float(np.mean(v)) for k, v in U.dict_mean(it_seg_results).items()}, **it_pooled}
+        print(f'  iter {it_idx} seg test dice(patch)={np.mean(it_seg_results["dice"]):.4f} '
+              f'dice(pooled)={it_pooled["dice_pooled"]:.4f} '
+              f'prec={it_pooled["precision_pooled"]:.4f} rec={it_pooled["recall_pooled"]:.4f}')
+        if args.probe_unlabeled and unlabeled_test:
+            probe = probe_unlabeled(net_seg, unlabeled_test, device, f'iter-{it_idx}')
+            log_metrics(f'iter-{it_idx}/seg', 'unlabeled_test', it_idx, probe)
+            summary['metrics'][f'iter{it_idx}_unlabeled'] = probe
     
     # test reg
     if cfg.test_reg:
@@ -520,4 +735,64 @@ for it_idx in range(cfg.iters_start, cfg.iters):
     it_seg_results = None
     it_reg_results = None
 
-print(f'Done. Results in {cfg.output_path} (summary: final_test_results.txt)')
+# CHANGED: one json per run with the full configuration and every headline number, and
+# one row per run in a shared index so runs can be compared without tensorboard.
+summary['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
+summary['minutes'] = round((time.time() - t_start) / 60, 1)
+with open(os.path.join(cfg.output_path, 'run_summary.json'), 'w', encoding='utf-8') as fh:
+    json.dump(summary, fh, indent=1, default=str)
+
+
+def flat_metric(stage, key, default=''):
+    return summary['metrics'].get(stage, {}).get(key, default)
+
+
+last_iter = f'iter{cfg.iters - 1}_seg_test' if cfg.iters > 0 else None
+index_row = {
+    'run_id': RUN_ID,
+    'finished': summary['finished'],
+    'minutes': summary['minutes'],
+    'output_path': cfg.output_path,
+    'data_path': cfg.data_path,
+    'note': args.note,
+    'loss': args.loss,
+    'aug': args.aug,
+    'aug_rate': args.aug_rate,
+    'jitter': not args.no_jitter,
+    'pre_seg_ep': cfg.pre_seg_ep,
+    'seg_ep': cfg.seg_ep,
+    'iters': cfg.iters,
+    'batch_size': cfg.train_batch_size,
+    'split_mode': dataset_info.get('split_mode', ''),
+    'block_size': dataset_info.get('block_size', ''),
+    'n_source': len(source),
+    'n_targets': len(target_train),
+    'n_valid': len(target_valid),
+    'n_test': len(target_test),
+    'valid_dice_patch': flat_metric('pre_seg_valid', 'dice'),
+    'valid_dice_pooled': flat_metric('pre_seg_valid', 'dice_pooled'),
+    'test_dice_patch': flat_metric('pre_seg_test', 'dice'),
+    'test_dice_pooled': flat_metric('pre_seg_test', 'dice_pooled'),
+    'test_precision': flat_metric('pre_seg_test', 'precision_pooled'),
+    'test_recall': flat_metric('pre_seg_test', 'recall_pooled'),
+    'test_pred_fg': flat_metric('pre_seg_test', 'pred_fg'),
+    'test_gt_fg': flat_metric('pre_seg_test', 'gt_fg'),
+    'unlab_pred_fg': flat_metric('pre_seg_unlabeled', 'pred_fg_mean'),
+    'unlab_flip_consistency': flat_metric('pre_seg_unlabeled', 'flip_consistency_mean'),
+    'unlab_confidence': flat_metric('pre_seg_unlabeled', 'confidence_mean'),
+    'final_iter_dice_pooled': flat_metric(last_iter, 'dice_pooled') if last_iter else '',
+}
+if args.runs_index:
+    new_index = not os.path.isfile(args.runs_index)
+    with open(args.runs_index, 'a', newline='', encoding='utf-8') as fh:
+        w = csv.DictWriter(fh, list(index_row))
+        if new_index:
+            w.writeheader()
+        w.writerow({k: (f'{v:.4f}' if isinstance(v, float) else v) for k, v in index_row.items()})
+
+print(f'Done in {summary["minutes"]} min. Results in {cfg.output_path}')
+print(f'  final_test_results.txt   human-readable summary')
+print(f'  metrics.csv              every logged metric (stage, split, epoch, metric, value)')
+print(f'  run_summary.json         config + headline metrics for this run')
+if args.runs_index:
+    print(f'  {args.runs_index}  one row per run, for cross-run comparison')

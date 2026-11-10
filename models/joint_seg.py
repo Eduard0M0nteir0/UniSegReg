@@ -77,6 +77,26 @@ class JointSegModel(BaseModel):
         eval_results = {'loss': loss,
                         'dice': dice,
                         'hausdorff': hausdorff}
+
+        # Foreground confusion counts and rates, per sample. `dice` above is averaged
+        # per patch, which on sparse patches says more about the patch than about the
+        # model; tp/fp/fn let the caller pool over all pixels of a split instead.
+        eps = 1e-9
+        p = pred[:, 1]
+        g = (lab_g[:, 1] > 0.5).to(p.dtype)
+        axis = tuple(range(1, p.ndim))
+        tp = (p * g).sum(axis)
+        fp = (p * (1 - g)).sum(axis)
+        fn = ((1 - p) * g).sum(axis)
+        eval_results.update({
+            'tp': tp.cpu().numpy(),
+            'fp': fp.cpu().numpy(),
+            'fn': fn.cpu().numpy(),
+            'precision': (tp / (tp + fp + eps)).cpu().numpy(),
+            'recall': (tp / (tp + fn + eps)).cpu().numpy(),
+            'pred_fg': p.mean(axis).cpu().numpy(),
+            'gt_fg': g.mean(axis).cpu().numpy(),
+        })
         
         log_image = kwargs.get('log_image', False)
         if log_image:

@@ -24,6 +24,12 @@ snmi/core/base_dataset.py + snmi/utils/utils.load_file):
                     test/    labeled: final segmentation/registration metrics.
                     source_test/ labeled atlases warped onto test/ images by the
                              registration test (paired by sorted order).
+                    unlabeled_test/ patches from donors held out of training entirely.
+                             No labels, so no dice; this is the only set that can show
+                             whether the model behaves on tissue it has never seen.
+                    annotated/ the whole annotated section, its mask and the split
+                             geometry (regions.json), for pooled region-wise scoring
+                             instead of patch-averaged scoring.
 
 Only tile.jpg has annotations (tile_annotations.geojson), so this script
   * rasterizes every annotated polygon part (holes respected) into a binary mask,
@@ -88,7 +94,7 @@ except ImportError:  # pragma: no cover - cv2 is a snmi dependency, but stay usa
 IMG_SUFFIX = "org.tif"
 LAB_SUFFIX = "lab_b.npy"
 WEIGHT_SUFFIX = "weight.tif"
-SPLITS = ("train", "valid", "test", "source_test")
+SPLITS = ("train", "valid", "test", "source_test", "unlabeled_test")
 
 
 # --------------------------------------------------------------------------- IO
@@ -118,6 +124,75 @@ def find_inputs(data_dir: Path):
 def load_gray(path: Path) -> np.ndarray:
     """Load an image as single-channel uint8 (the nets take in_channels=1)."""
     return np.asarray(Image.open(path).convert("L"), dtype=np.uint8)
+
+
+def donor_of(path: Path) -> str:
+    """Donor/case id: everything before the first underscore ('1PAS_01' -> '1PAS')."""
+    return Path(path).stem.split("_")[0]
+
+
+# -------------------------------------------------------------- overlap check
+
+def _box_sums(img: np.ndarray, kh: int, kw: int) -> np.ndarray:
+    """Exact local sums over every kh x kw window, via a float64 integral image."""
+    ii = np.zeros((img.shape[0] + 1, img.shape[1] + 1), np.float64)
+    np.cumsum(np.cumsum(img, 0), 1, out=ii[1:, 1:])
+    return ii[kh:, kw:] - ii[:-kh, kw:] - ii[kh:, :-kw] + ii[:-kh, :-kw]
+
+
+def ncc_max(img: np.ndarray, tpl: np.ndarray, min_std: float = 3.0) -> float:
+    """Max normalized cross correlation of `tpl` anywhere in `img`.
+
+    Positions whose local standard deviation is below `min_std` (blank slide) are
+    skipped: there the correlation is numerically meaningless.
+    """
+    from scipy.signal import fftconvolve
+
+    kh, kw = tpl.shape
+    if img.shape[0] < kh or img.shape[1] < kw:
+        return 0.0
+    t = tpl - tpl.mean()
+    tn = float(np.sqrt((t * t).sum()))
+    if tn == 0:
+        return 0.0
+    num = fftconvolve(img, t[::-1, ::-1], mode="valid")
+    n = float(t.size)
+    s1 = _box_sums(img, kh, kw)
+    var = _box_sums(img * img, kh, kw) - s1 * s1 / n
+    ok = np.sqrt(np.maximum(var, 0.0)) / np.sqrt(n) > min_std
+    if not ok.any():
+        return 0.0
+    return float((num[ok] / (np.sqrt(np.maximum(var[ok], 1e-9)) * tn)).max())
+
+
+def find_overlapping_images(labeled: Path, images, scale: int = 4, templ: int = 96,
+                            threshold: float = 0.9):
+    """Images that contain the pixels of the annotated image.
+
+    The annotated tile of this dataset turned out to be a re-export of one of the case
+    images (tile.jpg == 3PAS_02.jpg, offset x+120 y-8, NCC 0.98), which silently put
+    validation and test tissue into the unlabeled training pool. This check catches that
+    class of mistake instead of trusting file names.
+    """
+    def small(path):
+        im = Image.open(path).convert("L")
+        return np.asarray(im.resize((im.width // scale, im.height // scale),
+                                    Image.BILINEAR), np.float64)
+
+    tile = small(labeled)
+    tpls = []
+    for (r, c) in ((0.35, 0.35), (0.55, 0.50), (0.40, 0.60)):
+        y, x = int(tile.shape[0] * r), int(tile.shape[1] * c)
+        patch = tile[y:y + templ, x:x + templ]
+        if patch.shape == (templ, templ):
+            tpls.append(patch)
+    scores = {}
+    for i, path in enumerate(images, 1):
+        scores[path.name] = max(ncc_max(small(path), t) for t in tpls)
+        if i % 50 == 0:
+            print(f"    overlap check {i}/{len(images)}", flush=True)
+    matches = sorted([n for n, s in scores.items() if s >= threshold])
+    return scores, matches
 
 
 def ring_area(ring) -> float:
@@ -338,9 +413,60 @@ def assign_blocks(mask, h, w, p, args):
 
 # ------------------------------------------------------------------------ build
 
-def build_labeled(args, out_root: Path, report: dict):
+def resolve_inputs(args, report: dict):
+    """Find the annotated image and the usable unlabeled images, with exclusions.
+
+    Excluded from the unlabeled pool: any image that overlaps the annotated image
+    (verified by cross correlation, not by name) and, unless --keep-donor-images,
+    every other image of that donor. Those pixels are already in train/valid/test.
+    """
+    labeled_img, geojson, unlabeled = find_inputs(Path(args.data_dir))
+    info = {"labeled_image": labeled_img.name, "annotations": geojson.name,
+            "candidates": len(unlabeled)}
+
+    manual = [c.strip() for c in (args.exclude_cases or "").split(",") if c.strip()]
+    excluded, reasons = set(), {}
+    for name in manual:
+        for p in unlabeled:
+            if p.name == name or donor_of(p) == name or p.stem == name:
+                excluded.add(p.name)
+                reasons[p.name] = f"--exclude-cases {name}"
+
+    if args.check_overlap:
+        print(f"  checking {len(unlabeled)} images for pixel overlap with "
+              f"{labeled_img.name} (--no-check-overlap to skip)", flush=True)
+        scores, matches = find_overlapping_images(labeled_img, unlabeled,
+                                                  threshold=args.overlap_threshold)
+        top = sorted(scores.items(), key=lambda kv: -kv[1])[:5]
+        info["overlap_ncc_top5"] = {k: round(v, 4) for k, v in top}
+        info["overlap_ncc_median"] = round(float(np.median(list(scores.values()))), 4)
+        info["overlap_matches"] = matches
+        print("    top correlations: "
+              + ", ".join(f"{k} {v:.3f}" for k, v in top))
+        for name in matches:
+            excluded.add(name)
+            reasons[name] = f"overlaps {labeled_img.name} (NCC {scores[name]:.3f})"
+        if matches and not args.keep_donor_images:
+            donors = {donor_of(Path(m)) for m in matches}
+            for p in unlabeled:
+                if donor_of(p) in donors and p.name not in excluded:
+                    excluded.add(p.name)
+                    reasons[p.name] = f"same donor as {sorted(donors)}"
+        if matches:
+            print(f"    EXCLUDED {len(excluded)} images: {sorted(donors) if not args.keep_donor_images else matches}")
+        else:
+            print("    no overlap found")
+
+    kept = [p for p in unlabeled if p.name not in excluded]
+    info["excluded"] = {k: reasons[k] for k in sorted(excluded)}
+    info["excluded_count"] = len(excluded)
+    info["usable"] = len(kept)
+    report["inputs"] = info
+    return labeled_img, geojson, kept
+
+
+def build_labeled(args, out_root: Path, report: dict, labeled_img: Path, geojson: Path):
     """Patch the annotated image into disjoint train / valid / test regions."""
-    labeled_img, geojson, _ = find_inputs(Path(args.data_dir))
     gray_full = load_gray(labeled_img)
     polygons, geo_stats = load_polygons(geojson)
     mask_full, raster_stats = rasterize(polygons, *gray_full.shape, min_area=args.min_polygon_area)
@@ -365,6 +491,12 @@ def build_labeled(args, out_root: Path, report: dict):
     else:
         regions, split_meta = assign_blocks(mask, h, w, p, args)
 
+    # Training patches need enough foreground to be worth a gradient step; evaluation
+    # patches do not. Sparse, stroma-heavy regions are exactly where this model fails,
+    # so valid/test keep everything above a much lower floor (0 foreground is still
+    # excluded because per-patch dice and hausdorff are undefined there).
+    min_fg = {"train": args.min_fg, "valid": args.min_fg_eval, "test": args.min_fg_eval}
+
     written = {k: [] for k in SPLITS}
     dropped = 0
     for name, boxes in regions.items():
@@ -373,7 +505,7 @@ def build_labeled(args, out_root: Path, report: dict):
                 for x in positions(w, p, stride, start=x0, stop=x1):
                     m = mask[y:y + p, x:x + p]
                     fg_frac = float(np.count_nonzero(m > 127)) / m.size
-                    if fg_frac < args.min_fg:  # keep metrics meaningful (hausdorff needs fg)
+                    if fg_frac < min_fg[name]:
                         dropped += 1
                         continue
                     g = gray[y:y + p, x:x + p]
@@ -415,6 +547,26 @@ def build_labeled(args, out_root: Path, report: dict):
         written["source_test"].append(str(out_root / "source_test" / img_path.name))
         copied_from.append(img_path.name)
 
+    # Whole-section artifacts. The labeled test area cannot grow beyond this one
+    # section, so the way to get a less noisy test number is to evaluate over the
+    # complete test region instead of 25 sampled patches. These three files carry
+    # everything needed for that: the section, its mask, and the split geometry.
+    ann = out_root / "annotated"
+    ann.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(gray, mode="L").save(ann / "section.tif")
+    Image.fromarray((mask > 127).astype(np.uint8) * 255, mode="L").save(ann / "section_mask.png")
+    (ann / "regions.json").write_text(json.dumps({
+        "image": "section.tif",
+        "mask": "section_mask.png",
+        "source": labeled_img.name,
+        "size": [int(w), int(h)],
+        "downscale": args.downscale,
+        "patch_size": p,
+        "regions": {k: [[int(v) for v in box] for box in boxes]
+                    for k, boxes in regions.items()},
+        **split_meta,
+    }, indent=1), encoding="utf-8")
+
     report["labeled_patches"] = {
         "source_image": labeled_img.name,
         **split_meta,
@@ -426,21 +578,37 @@ def build_labeled(args, out_root: Path, report: dict):
         "splits_independent": False,  # one slide: same donor, same section
         "foreground_density_per_split": density,
         "source_test_copied_from_train": copied_from,
+        "min_fg_train": args.min_fg,
+        "min_fg_eval": args.min_fg_eval,
         "dropped_low_foreground": dropped,
         **{k: len(v) for k, v in written.items()},
     }
     return written
 
 
-def build_unlabeled(args, out_root: Path, report: dict):
-    """Patch every unannotated image into the unlabeled target pool in train/."""
-    _, _, unlabeled = find_inputs(Path(args.data_dir))
+def build_unlabeled(args, out_root: Path, report: dict, unlabeled):
+    """Patch the unannotated images into the train pool and a held-out donor set.
+
+    `--unlabeled-test-frac` of the *donors* go to unlabeled_test/ and are touched by
+    nothing in training: not as pseudo-label targets, not as registration pairs. They
+    have no labels, so they cannot give a dice, but they are the only data that can
+    answer "does this model behave sanely on tissue it has never seen", through
+    label-free checks (foreground fraction, flip consistency, confidence).
+    """
     if args.limit_images:
         unlabeled = unlabeled[:args.limit_images]
 
+    donors = sorted({donor_of(p) for p in unlabeled})
+    n_hold = int(round(len(donors) * args.unlabeled_test_frac))
+    held = []
+    if n_hold > 0 and n_hold < len(donors):
+        rng_d = np.random.RandomState(args.seed + 2)
+        held = sorted(rng_d.choice(donors, size=n_hold, replace=False).tolist())
+
     p, stride = args.patch_size, args.unlabeled_stride
     rng = np.random.RandomState(args.seed + 1)
-    written, per_image, skipped_images = [], {}, []
+    written = {"train": [], "unlabeled_test": []}
+    per_image, skipped_images = {}, []
 
     for idx, path in enumerate(unlabeled):
         gray = downscale(load_gray(path), args.downscale, is_mask=False)
@@ -461,11 +629,12 @@ def build_unlabeled(args, out_root: Path, report: dict):
             sel = rng.choice(len(cands), size=args.max_per_image, replace=False)
             cands = [cands[int(i)] for i in sorted(sel)]
 
+        split = "unlabeled_test" if donor_of(path) in held else "train"
         safe_stem = path.stem.replace(".", "-")
         for (y, x) in cands:
             stem = f"unl_{safe_stem}_x{x:05d}_y{y:05d}_"
-            written.append(write_sample(
-                out_root / "train", stem, gray[y:y + p, x:x + p],
+            written[split].append(write_sample(
+                out_root / split, stem, gray[y:y + p, x:x + p],
                 None,   # placeholder label (all background)
                 None,   # zero weight -> contributes nothing if ever used in a loss
                 args.label_format))
@@ -473,8 +642,12 @@ def build_unlabeled(args, out_root: Path, report: dict):
 
     report["unlabeled"] = {
         "images": len(unlabeled),
+        "donors": len(donors),
+        "donors_heldout": held,
+        "images_heldout": sum(1 for p in unlabeled if donor_of(p) in held),
         "images_without_usable_patch": skipped_images,
-        "patches": len(written),
+        "patches_train": len(written["train"]),
+        "patches_unlabeled_test": len(written["unlabeled_test"]),
         "patches_per_image": per_image,
     }
     return written
@@ -484,7 +657,8 @@ def build_unlabeled(args, out_root: Path, report: dict):
 
 def write_manifests(out_root: Path, labeled, unlabeled, args, report):
     source = sorted(labeled["train"])
-    target_train = sorted(unlabeled)
+    target_train = sorted(unlabeled["train"])
+    unlabeled_test = sorted(unlabeled["unlabeled_test"])
     splits = {
         "data_path": str(out_root),
         "img_suffix": IMG_SUFFIX,
@@ -499,6 +673,9 @@ def write_manifests(out_root: Path, labeled, unlabeled, args, report):
         "valid": [os.path.relpath(f, out_root) for f in sorted(labeled["valid"])],
         "test": [os.path.relpath(f, out_root) for f in sorted(labeled["test"])],
         "source_test": [os.path.relpath(f, out_root) for f in sorted(labeled["source_test"])],
+        "unlabeled_test": [os.path.relpath(f, out_root) for f in unlabeled_test],
+        "unlabeled_test_donors": report["unlabeled"]["donors_heldout"],
+        "excluded_images": report["inputs"]["excluded"],
     }
     (out_root / "splits.json").write_text(json.dumps(splits, indent=1), encoding="utf-8")
     (out_root / "dataset_report.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
@@ -528,11 +705,13 @@ Generated by `prepare_data_2d.py` from `{args.data_dir}`.
 ## Layout
 ```
 {out_root.name}/
-  train/        {len(source)} labeled source patches (src_*) + {len(target_train)} unlabeled target patches (unl_*)
-  valid/        {len(splits['valid'])} labeled patches
-  test/         {len(splits['test'])} labeled patches
-  source_test/  {len(splits['source_test'])} labeled atlas patches for the registration test
-  splits.json   explicit file lists (source vs. unlabeled targets)
+  train/           {len(source)} labeled source patches (src_*) + {len(target_train)} unlabeled target patches (unl_*)
+  valid/           {len(splits['valid'])} labeled patches
+  test/            {len(splits['test'])} labeled patches
+  source_test/     {len(splits['source_test'])} labeled atlas patches for the registration test
+  unlabeled_test/  {len(unlabeled_test)} patches from {len(report['unlabeled']['donors_heldout'])} held-out donors, no labels, never trained on
+  annotated/       section.tif + section_mask.png + regions.json (whole-section evaluation)
+  splits.json      explicit file lists, held-out donors, excluded images
 ```
 Every sample is a triplet sharing one stem:
 `<stem>org.tif` (uint8 grayscale {args.patch_size}x{args.patch_size}),
@@ -578,10 +757,35 @@ comparable (a large gap here shows up directly as a validation/test dice gap):
 * `source_test/` is a copy of {len(splits['source_test'])} train-band patches, on purpose: those are the labeled atlases the registration test warps onto `test/` images. They are model inputs, never evaluation ground truth, but they are train data - do not call them held out.
 * The {len(target_train)} patches from the {report['unlabeled']['images']} unannotated images are train targets only; nothing in `valid/` or `test/` comes from them.
 
-If a case-level held-out test set is needed later, annotate one or more of the other
-images and move their patches into `test/` - the layout and this script support it
-(point `--data-dir` at a folder with several image+geojson pairs would require
-extending `find_inputs`, which currently expects exactly one geojson).
+## What each evaluation set can answer
+
+| set | labels | question it answers |
+|---|---|---|
+| `valid/` | yes | when to stop, which checkpoint to keep |
+| `test/` | yes | accuracy on unseen regions of the one annotated section |
+| `annotated/` | yes | the same, pooled over the whole test region instead of sampled patches, and broken down per block so failing regions are identifiable |
+| `unlabeled_test/` | no | does the model behave sanely on {len(report['unlabeled']['donors_heldout'])} donors it has never seen, measured label-free (foreground fraction, flip consistency, confidence) |
+
+`test/` is small by construction: one section, {len(splits['test'])} patches, so its
+patch-averaged dice has a standard error of roughly 0.04. Treat differences below ~0.08
+as noise and prefer the pooled number over the patch average.
+
+`unlabeled_test/` donors are excluded from `train/` entirely, so they are the only
+honest answer to "will this generalize to a new case". It cannot produce a dice; use it
+to detect collapse, drift of the predicted foreground fraction, and instability.
+
+## Exclusions
+
+`{report['inputs']['excluded_count']}` image(s) were dropped from the unlabeled pool:
+{chr(10).join(f"* `{k}`: {v}" for k, v in list(report['inputs']['excluded'].items())[:8]) or '* none'}
+
+This matters: the annotated tile of this dataset is a re-export of one of the case
+images, so leaving that donor in the unlabeled pool puts validation and test tissue
+into the pseudo-label training set. The check is correlation-based, not name-based.
+
+If a case-level labeled test set is needed later, annotate one or more of the other
+images and move their patches into `test/`; supporting several image+geojson pairs
+would mean extending `find_inputs`, which currently expects exactly one geojson.
 
 ## train2D.py settings for this dataset
 ```python
@@ -712,7 +916,10 @@ def main(argv=None):
     ap.add_argument("--min-polygon-area", type=float, default=10.0,
                     help="drop annotation parts smaller than this (px^2, full resolution)")
     ap.add_argument("--min-fg", type=float, default=0.02,
-                    help="min foreground fraction to keep a labeled patch")
+                    help="min foreground fraction to keep a labeled TRAIN patch")
+    ap.add_argument("--min-fg-eval", type=float, default=0.005,
+                    help="min foreground fraction for valid/test patches; lower than "
+                         "--min-fg on purpose, so sparse regions stay in the evaluation")
     ap.add_argument("--min-tissue", type=float, default=0.4,
                     help="min stained-pixel fraction to keep an unlabeled patch")
     ap.add_argument("--bright-cut", type=int, default=220, help="gray level above which a pixel is slide background")
@@ -731,6 +938,18 @@ def main(argv=None):
                     help="share of the annotated image (area for bands, blocks for blocks) for valid/")
     ap.add_argument("--test-frac", type=float, default=0.2, help="same, for test/")
     ap.add_argument("--n-source-test", type=int, default=5, help="labeled atlases copied to source_test/")
+    ap.add_argument("--unlabeled-test-frac", type=float, default=0.2,
+                    help="share of DONORS held out into unlabeled_test/ (no labels, never trained on)")
+    ap.add_argument("--check-overlap", dest="check_overlap", action="store_true", default=True,
+                    help="correlate every case image against the annotated one and exclude "
+                         "any that contains the same pixels (default: on, ~1-2 min)")
+    ap.add_argument("--no-check-overlap", dest="check_overlap", action="store_false")
+    ap.add_argument("--overlap-threshold", type=float, default=0.9,
+                    help="NCC above which an image counts as containing the annotated pixels")
+    ap.add_argument("--keep-donor-images", action="store_true",
+                    help="exclude only the overlapping image, not the rest of its donor")
+    ap.add_argument("--exclude-cases", default="",
+                    help="comma-separated donors or file names to drop from the unlabeled pool")
     ap.add_argument("--label-format", choices=("onehot", "binary255"), default="onehot")
     ap.add_argument("--seed", type=int, default=1234)
     ap.add_argument("--overwrite", action="store_true", help="delete out-dir first")
@@ -751,7 +970,8 @@ def main(argv=None):
 
     report = {"args": vars(args)}
     print(f"Reading   {args.data_dir}")
-    labeled = build_labeled(args, out_root, report)
+    labeled_img, geojson, usable = resolve_inputs(args, report)
+    labeled = build_labeled(args, out_root, report, labeled_img, geojson)
     li = report["labeled_image"]
     print(f"  labeled {li['file']} + {li['annotations']}: {li['features']} annotation features "
           f"({li['multipolygon_features']} MultiPolygon) -> {li['polygon_parts']} polygon parts "
@@ -766,20 +986,27 @@ def main(argv=None):
              if lp["split_mode"] == "blocks" else f" bands_x={lp['bands_x']}"))
     print(f"  patches train={len(labeled['train'])} valid={len(labeled['valid'])} "
           f"test={len(labeled['test'])} source_test={len(labeled['source_test'])} "
-          f"(dropped {lp['dropped_low_foreground']} with <{args.min_fg:.0%} foreground)")
+          f"(dropped {lp['dropped_low_foreground']}: min_fg train {args.min_fg:.1%} / "
+          f"eval {args.min_fg_eval:.1%})")
     for name, d in lp["foreground_density_per_split"].items():
         print(f"    {name:6s} n={d['patches']:4d}  foreground mean={d['fg_mean']:.3f} "
               f"median={d['fg_median']:.3f}")
 
-    unlabeled = build_unlabeled(args, out_root, report)
-    print(f"  unlabeled {report['unlabeled']['images']} images -> "
-          f"{len(unlabeled)} target patches in train/")
+    unlabeled = build_unlabeled(args, out_root, report, usable)
+    ul = report["unlabeled"]
+    print(f"  unlabeled {ul['images']} images / {ul['donors']} donors -> "
+          f"{ul['patches_train']} train patches")
+    print(f"    held out {len(ul['donors_heldout'])} donors "
+          f"({ul['images_heldout']} images, {ul['patches_unlabeled_test']} patches) "
+          f"-> unlabeled_test/: {', '.join(ul['donors_heldout']) or 'none'}")
 
     splits = write_manifests(out_root, labeled, unlabeled, args, report)
     print(f"Wrote     {out_root}")
     print(f"  train/ {len(splits['source'])} src_ + {len(splits['target_train'])} unl_ images")
     print(f"  valid/ {len(splits['valid'])}   test/ {len(splits['test'])}   "
-          f"source_test/ {len(splits['source_test'])}")
+          f"source_test/ {len(splits['source_test'])}   "
+          f"unlabeled_test/ {len(splits['unlabeled_test'])}")
+    print(f"  annotated/section.tif + section_mask.png + regions.json")
     print(f"  splits.json, dataset_report.json, README_dataset.md")
 
     if args.verify:
