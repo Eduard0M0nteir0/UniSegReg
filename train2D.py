@@ -37,6 +37,13 @@ Differences from the published train2D.py, all marked `# CHANGED` below:
  11. `--probe-unlabeled` scores the held-out donors in `unlabeled_test/` label-free
      (predicted foreground fraction, left-right flip consistency, confidence), which is
      the only read available on generalization to unseen cases.
+ 12. Pooled metrics are reported **per block** of the annotated section (read from
+     `annotated/regions.json`), because one number per split hides the spread that
+     matters: three tubule-rich test blocks at 0.85-0.90 pooled dice next to one
+     atypical block at 0.45.
+ 13. `--val-metric` decides what `model_best.pt` is selected on; the default is pooled
+     validation dice rather than validation loss, which in the 400-epoch run kept
+     falling long after dice had peaked.
 
 Run `python train2D.py --help` for the options, `--quick` for a smoke test.
 """
@@ -46,6 +53,7 @@ import csv
 import glob
 import json
 import os
+import re
 import shutil
 import time
 
@@ -104,6 +112,11 @@ def parse_args(argv=None):
                     help='disable the gamma/noise jitter that comes with --aug dihedral')
     ap.add_argument('--early-stop-patience', type=int, default=0,
                     help='stop pre-training after N evaluations without improvement (0 = off)')
+    ap.add_argument('--val-metric', choices=('dice_pooled', 'dice', 'loss'), default='dice_pooled',
+                    help='what model_best.pt is selected on. The published setting is the '
+                         'validation loss, but in the 400-epoch run the loss kept falling '
+                         'while validation dice peaked around epoch 100, so loss selected a '
+                         'checkpoint ~0.02 dice below the best one')
     ap.add_argument('--run-id', default=None,
                     help='name of this run in metrics.csv / runs_index.csv (default: folder + timestamp)')
     ap.add_argument('--runs-index', default=os.path.join(HERE, 'runs_index.csv'),
@@ -154,6 +167,7 @@ def build_seg_loss(name):
                                               sigma=args.boundary_sigma): 0.5}
 
 
+T_START = time.time()   # CHANGED: was started after pre-training, so runtime read ~0
 RUN_ID = args.run_id or f"{os.path.basename(os.path.normpath(args.output_path))}-{time.strftime('%Y%m%d-%H%M%S')}"
 METRICS_CSV = os.path.join(args.output_path, 'metrics.csv')
 METRIC_FIELDS = ('run_id', 'stage', 'split', 'epoch', 'metric', 'value')
@@ -195,6 +209,78 @@ def pooled(results, keys=('tp', 'fp', 'fn')):
     return {'dice_pooled': 2 * tp / (2 * tp + fp + fn + eps),
             'precision_pooled': tp / (tp + fp + eps),
             'recall_pooled': tp / (tp + fn + eps)}
+
+
+def load_regions(data_path):
+    """Block geometry written by prepare_data_2d.py (annotated/regions.json)."""
+    try:
+        with open(os.path.join(data_path, 'annotated', 'regions.json'), encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def block_of(path, boxes, patch):
+    """The [y0,y1,x0,x1] block that fully contains this patch, from its file name."""
+    m = re.search(r'_x(\d+)_y(\d+)_', os.path.basename(path))
+    if not m:
+        return None
+    x, y = int(m.group(1)), int(m.group(2))
+    for b in boxes:
+        if y >= b[0] and y + patch <= b[1] and x >= b[2] and x + patch <= b[3]:
+            return tuple(b)
+    return None
+
+
+def block_report(files, results, split, regions):
+    """Pooled metrics per block of the annotated section.
+
+    One number over a split hides what matters: in the first block-split run three
+    tubule-rich test blocks scored 0.85-0.90 pooled dice while a single atypical block
+    scored 0.45 and dragged the total to 0.79. Per block is the standard report.
+    """
+    if not regions or split not in regions.get('regions', {}) or 'tp' not in results:
+        return []
+    boxes = [tuple(b) for b in regions['regions'][split]]
+    patch = regions['patch_size']
+    tp, fp, fn = (np.asarray(results[k]).reshape(-1) for k in ('tp', 'fp', 'fn'))
+    if len(tp) != len(files):
+        return []        # order/length mismatch: refuse to guess
+    acc = {}
+    for i, f in enumerate(files):
+        key = block_of(f, boxes, patch) or ('unassigned',)
+        d = acc.setdefault(key, {'tp': 0.0, 'fp': 0.0, 'fn': 0.0, 'n': 0})
+        d['tp'] += float(tp[i]); d['fp'] += float(fp[i]); d['fn'] += float(fn[i]); d['n'] += 1
+    eps, px = 1e-9, patch * patch
+    rows = []
+    for key, d in acc.items():
+        t, f_, n_ = d['tp'], d['fp'], d['fn']
+        rows.append({'block': 'y%d-%d_x%d-%d' % key if len(key) == 4 else key[0],
+                     'patches': d['n'],
+                     'dice_pooled': 2 * t / (2 * t + f_ + n_ + eps),
+                     'precision_pooled': t / (t + f_ + eps),
+                     'recall_pooled': t / (t + n_ + eps),
+                     'gt_fg': (t + n_) / (d['n'] * px),
+                     'pred_fg': (t + f_) / (d['n'] * px)})
+    return sorted(rows, key=lambda r: -r['dice_pooled'])
+
+
+def report_blocks(stage, split, files, results, regions, epoch=0):
+    """Print, log and return the per-block table."""
+    rows = block_report(files, results, split, regions)
+    if not rows:
+        return rows
+    print(f'  {stage} {split} per block (pooled over the pixels of each block):')
+    for r in rows:
+        print(f'    {r["block"]:22s} n={r["patches"]:3d}  dice={r["dice_pooled"]:.4f}  '
+              f'prec={r["precision_pooled"]:.4f}  rec={r["recall_pooled"]:.4f}  '
+              f'gt_fg={r["gt_fg"]:.3f}  pred_fg={r["pred_fg"]:.3f}')
+        log_metrics(stage, f'{split}:{r["block"]}', epoch,
+                    {k: v for k, v in r.items() if k != 'block'})
+    worst = rows[-1]
+    print(f'    worst block {worst["block"]} at dice {worst["dice_pooled"]:.4f} '
+          f'(best {rows[0]["dice_pooled"]:.4f})')
+    return rows
 
 
 class TeeWriter:
@@ -350,7 +436,10 @@ class cfg:
     seg_log_validation_image = args.log_images
     reg_log_validation_image = args.log_images   # CHANGED: off by default (slow on CPU)
     save_frequency = None
-    val_loss_key = 'loss'   # key of evaluation result to control early stop and best ckpt save
+    # CHANGED: Trainer minimises this key, so an accuracy is selected through its
+    # negation (see JointSegModel.eval_step).
+    val_loss_key = {'loss': 'loss', 'dice': 'neg_dice',
+                    'dice_pooled': 'neg_dice_pooled'}[args.val_metric]
     early_stop_patience = args.early_stop_patience or None   # CHANGED: now actually passed
     learning_rate_schedule = None
 
@@ -549,10 +638,14 @@ target_set = None
 if cfg.use_reg:   # CHANGED: the assessment set is only needed by the iterative loop
     target_set = SegRegDataset(source, target_train, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix], ass_pre, is_assessment=True, num_assessment=cfg.num_assessment)
 
+regions = load_regions(cfg.data_path)   # CHANGED: block geometry for per-block reports
+if regions is None:
+    print('  note: no annotated/regions.json in the dataset, per-block report disabled')
+
 summary = {'run_id': RUN_ID, 'args': vars(args), 'dataset': dataset_info,
-           'device': str(device), 'started': time.strftime('%Y-%m-%d %H:%M:%S'),
+           'device': str(device), 'val_metric': args.val_metric,
+           'started': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(T_START)),
            'metrics': {}}
-t_start = time.time()
 
 if cfg.iters_start == 0:
     # Restore pre-trained model   # CHANGED: both branches now read this run's output
@@ -592,9 +685,21 @@ if cfg.iters_start == 0:
               f'prec={seg_pooled["precision_pooled"]:.4f} rec={seg_pooled["recall_pooled"]:.4f}')
         print(f'  pre_seg  valid dice(patch)={np.mean(valid_results["dice"]):.4f} '
               f'dice(pooled)={valid_pooled["dice_pooled"]:.4f}')
+        # CHANGED: per-block pooled metrics are now part of every report
+        test_blocks = report_blocks('pre_seg', 'test', target_test, seg_results, regions)
+        valid_blocks = report_blocks('pre_seg', 'valid', target_valid, valid_results, regions)
+        summary['metrics']['pre_seg_test_blocks'] = test_blocks
+        summary['metrics']['pre_seg_valid_blocks'] = valid_blocks
         with open(f'{cfg.output_path}/final_test_results.txt', 'a+') as f:
             f.write(f'  Seg - {U.dict_to_str(seg_results)}\n')
             f.write(f'  Seg pooled - ' + '  '.join(f'{k}: {v:.4f}' for k, v in seg_pooled.items()) + '\n')
+            f.write(f'  Seg valid pooled - ' + '  '.join(f'{k}: {v:.4f}' for k, v in valid_pooled.items()) + '\n')
+            for split_name, rows in (('test', test_blocks), ('valid', valid_blocks)):
+                for r in rows:
+                    f.write(f'    block {split_name} {r["block"]:22s} n={r["patches"]:3d} '
+                            f'dice={r["dice_pooled"]:.4f} prec={r["precision_pooled"]:.4f} '
+                            f'rec={r["recall_pooled"]:.4f} gt_fg={r["gt_fg"]:.3f} '
+                            f'pred_fg={r["pred_fg"]:.3f}\n')
         if args.probe_unlabeled and unlabeled_test:
             probe = probe_unlabeled(net_seg, unlabeled_test, device, 'pre_seg')
             log_metrics('pre_seg', 'unlabeled_test', 0, probe)
@@ -698,6 +803,8 @@ for it_idx in range(cfg.iters_start, cfg.iters):
         # CHANGED: pooled metrics, CSV and the unlabeled probe, per iteration
         it_pooled = pooled(it_seg_results)
         log_metrics(f'iter-{it_idx}/seg', 'test', it_idx, {**U.dict_mean(it_seg_results), **it_pooled})
+        summary['metrics'][f'iter{it_idx}_seg_test_blocks'] = report_blocks(
+            f'iter-{it_idx}/seg', 'test', target_test, it_seg_results, regions, epoch=it_idx)
         summary['metrics'][f'iter{it_idx}_seg_test'] = {
             **{k: float(np.mean(v)) for k, v in U.dict_mean(it_seg_results).items()}, **it_pooled}
         print(f'  iter {it_idx} seg test dice(patch)={np.mean(it_seg_results["dice"]):.4f} '
@@ -738,7 +845,7 @@ for it_idx in range(cfg.iters_start, cfg.iters):
 # CHANGED: one json per run with the full configuration and every headline number, and
 # one row per run in a shared index so runs can be compared without tensorboard.
 summary['finished'] = time.strftime('%Y-%m-%d %H:%M:%S')
-summary['minutes'] = round((time.time() - t_start) / 60, 1)
+summary['minutes'] = round((time.time() - T_START) / 60, 1)   # CHANGED: whole run
 with open(os.path.join(cfg.output_path, 'run_summary.json'), 'w', encoding='utf-8') as fh:
     json.dump(summary, fh, indent=1, default=str)
 
@@ -777,6 +884,11 @@ index_row = {
     'test_recall': flat_metric('pre_seg_test', 'recall_pooled'),
     'test_pred_fg': flat_metric('pre_seg_test', 'pred_fg'),
     'test_gt_fg': flat_metric('pre_seg_test', 'gt_fg'),
+    'test_blocks': len(summary['metrics'].get('pre_seg_test_blocks', [])),
+    'test_block_dice_best': (summary['metrics'].get('pre_seg_test_blocks') or [{}])[0].get('dice_pooled', ''),
+    'test_block_dice_worst': (summary['metrics'].get('pre_seg_test_blocks') or [{}])[-1].get('dice_pooled', ''),
+    'test_block_worst': (summary['metrics'].get('pre_seg_test_blocks') or [{}])[-1].get('block', ''),
+    'val_metric': args.val_metric,
     'unlab_pred_fg': flat_metric('pre_seg_unlabeled', 'pred_fg_mean'),
     'unlab_flip_consistency': flat_metric('pre_seg_unlabeled', 'flip_consistency_mean'),
     'unlab_confidence': flat_metric('pre_seg_unlabeled', 'confidence_mean'),

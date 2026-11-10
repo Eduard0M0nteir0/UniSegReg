@@ -97,6 +97,15 @@ class JointSegModel(BaseModel):
             'pred_fg': p.mean(axis).cpu().numpy(),
             'gt_fg': g.mean(axis).cpu().numpy(),
         })
+
+        # Dice pooled over the pixels of this batch, plus negated copies of the two dice
+        # variants. Trainer selects the best checkpoint by *minimising* a key of this
+        # dict, so selecting on an accuracy needs its negation; see --val-metric.
+        tp_s, fp_s, fn_s = tp.sum(), fp.sum(), fn.sum()
+        dice_pooled = float((2 * tp_s / (2 * tp_s + fp_s + fn_s + eps)).item())
+        eval_results.update({'dice_pooled': dice_pooled,
+                             'neg_dice_pooled': -dice_pooled,
+                             'neg_dice': -float(np.mean(dice))})
         
         log_image = kwargs.get('log_image', False)
         if log_image:
