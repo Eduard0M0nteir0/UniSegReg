@@ -1,0 +1,11 @@
+# Python cache
+__pycache__/
+
+# Data and output directories
+data/
+data_2d/
+predictions/
+results_2D/
+
+# Specific scripts
+predict2D.py

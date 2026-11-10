@@ -106,3 +106,79 @@ class RandomForegroundCrop():
         data_dict.update({self.img_suffix: img})
 
         return data_dict  
+
+
+class IntensityJitter:
+    """Photometric jitter that survives per-patch min_max normalization.
+
+    Brightness/contrast scaling is pointless when the pre-processing applies min_max
+    afterwards (it re-stretches the patch and undoes any affine change), so this only
+    applies a gamma curve and additive noise, which min_max cannot undo.
+    """
+
+    def __init__(self, gamma_range=(0.7, 1.4), noise_std=0.02, rate=0.5):
+        self.gamma_range = gamma_range
+        self.noise_std = noise_std
+        self.rate = rate
+
+    def __call__(self, img):
+        if np.random.rand() > self.rate:
+            return img
+        x = np.asarray(img, np.float32)
+        lo, hi = float(x.min()), float(x.max())
+        scale = hi - lo if hi > lo else 1.0
+        x01 = (x - lo) / scale
+        if self.gamma_range is not None:
+            g = np.random.uniform(*self.gamma_range)
+            x01 = np.power(np.clip(x01, 0, 1), g)
+        if self.noise_std:
+            x01 = x01 + np.random.normal(0, self.noise_std, x01.shape).astype(np.float32)
+        return np.clip(x01, 0, 1) * scale + lo
+
+
+class RandomDihedral2D:
+    """Random element of the 8-fold dihedral group, applied to several keys at once.
+
+    Why not `RandomAugmentation`: that class rotates by an arbitrary angle on axes
+    [0, 1], which (a) interpolates and leaves zero-filled corners that never occur in
+    real tissue, (b) assumes every array is [H, W] and so would rotate the channel axis
+    of a one-hot [2, H, W] label, and (c) leaves the weight map untouched, pairing an
+    augmented image with an unaugmented confidence map.
+
+    This class works on the last two axes, so [H, W], [C, H, W] and [C, H, W, ...] all
+    behave, applies the identical geometric transform to every listed key, and uses
+    only rot90/flip, which are exact (no interpolation, no padding).
+
+    Parameters
+    ----------
+    image_keys: keys that get the geometric transform and the optional jitter.
+    map_keys: keys that get the geometric transform only (labels, weight maps).
+    aug_rate: probability of applying a geometric transform at all.
+    jitter: an IntensityJitter (or any callable on an array), applied to image_keys.
+    """
+
+    def __init__(self, image_keys, map_keys=(), aug_rate=1.0, jitter=None):
+        self.image_keys = list(image_keys)
+        self.map_keys = list(map_keys)
+        self.aug_rate = aug_rate
+        self.jitter = jitter
+
+    def __call__(self, data_dict):
+        k = np.random.randint(4)
+        flip = np.random.rand() < 0.5
+        apply_geom = np.random.rand() <= self.aug_rate
+
+        for key in self.image_keys + self.map_keys:
+            if key not in data_dict:
+                continue
+            x = data_dict[key]
+            if apply_geom:
+                if k:
+                    x = np.rot90(x, k, axes=(-2, -1))
+                if flip:
+                    x = np.flip(x, -1)
+                x = np.ascontiguousarray(x)   # torch cannot take negative strides
+            if self.jitter is not None and key in self.image_keys:
+                x = self.jitter(x)
+            data_dict[key] = x
+        return data_dict

@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import scipy.ndimage as nd
 
 from . import process_methods as P
 
@@ -328,3 +329,59 @@ class Grad:
 
         return grad
     
+
+
+class BoundarySeparationCrossEntropy:
+    """Cross entropy weighted up near label boundaries (Ronneberger et al., U-Net 2015).
+
+    Plain CE and foreground-only Dice both tolerate a prediction that bleeds across the
+    thin septa between touching objects, because those septa are few pixels wide. This
+    adds `w0 * exp(-d^2 / 2 sigma^2)` to the weight of every pixel, where d is the
+    distance to the nearest label boundary, which makes the separating gaps expensive to
+    miss.
+
+    Unlike `CrossEntropy` this keeps soft targets (no argmax), so soft pseudo-labels
+    stay soft. If the batch carries a `weight` map (the confidence map of a
+    pseudo-label), it is multiplied in.
+
+    Parameters
+    ----------
+    w0: height of the boundary bump.
+    sigma: width of the bump in pixels; set it to about the width of the gaps you want
+        the model to keep open.
+    base: weight far away from any boundary.
+    """
+
+    def __init__(self, w0=10.0, sigma=5.0, base=1.0, fg_channel=1):
+        self.w0 = w0
+        self.sigma = sigma
+        self.base = base
+        self.fg_channel = fg_channel
+
+    def boundary_weights(self, target):
+        fg = (target[:, self.fg_channel] > 0.5).detach().cpu().numpy()
+        w = np.empty(fg.shape, np.float32)
+        for i in range(fg.shape[0]):
+            m = fg[i]
+            if not m.any() or m.all():       # no boundary in this sample
+                w[i] = self.base
+                continue
+            # distance_transform_edt returns 0 on the zero-valued side, so the two
+            # transforms have disjoint support and the SUM is the distance to the
+            # boundary on both sides of it (a minimum would be 0 everywhere).
+            d = nd.distance_transform_edt(m) + nd.distance_transform_edt(~m)
+            w[i] = self.base + self.w0 * np.exp(-(d ** 2) / (2.0 * self.sigma ** 2))
+        return torch.from_numpy(w).to(target.device)
+
+    def __call__(self, data_dict):
+        logits = data_dict['logits']
+        target = data_dict['target']
+
+        with torch.no_grad():
+            w = self.boundary_weights(target)
+            if 'weight' in data_dict:
+                w = w * data_dict['weight'][:, 0, ...]
+
+        log_prob = F.log_softmax(logits, dim=1)
+        loss = -(target * log_prob).sum(1) * w
+        return loss.mean()
