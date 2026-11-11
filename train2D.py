@@ -44,6 +44,17 @@ Differences from the published train2D.py, all marked `# CHANGED` below:
  13. `--val-metric` decides what `model_best.pt` is selected on; the default is pooled
      validation dice rather than validation loss, which in the 400-epoch run kept
      falling long after dice had peaked.
+ 14. `--lr-schedule {none,cosine,step}` anneals the learning rate of the segmentation
+     stages, per epoch, through the `learning_rate_schedule` hook `Trainer.train`
+     already had but that was never wired. The registration stages keep the paper's
+     fixed learning rates. Default `none` reproduces the previous baseline exactly.
+ 15. Everything is seeded (`--seed`, `--no-deterministic`). Without this, four runs of
+     one recipe spanned 0.7032 to 0.7963 pooled test dice, which is wider than any
+     effect we are trying to measure. Repeats are obtained by changing `--seed`.
+ 16. `--control-no-pseudo` runs the iterative stage on the labeled source patches only.
+     The iterative stage was observed to cost up to 0.125 test dice, but the published
+     code changes two things at once (it adds pseudo-labels *and* retrains for N more
+     rounds at a different learning rate). This control changes only the first.
 
 Run `python train2D.py --help` for the options, `--quick` for a smoke test.
 """
@@ -53,6 +64,7 @@ import csv
 import glob
 import json
 import os
+import random
 import re
 import shutil
 import time
@@ -92,7 +104,7 @@ def parse_args(argv=None):
     ap.add_argument('--test-only', action='store_true',
                     help='skip all training, only test from existing checkpoints')
     ap.add_argument('--iters', type=int, default=3, help='joint seg/reg iterations (paper: 10)')
-    ap.add_argument('--pre-seg-ep', type=int, default=400, help='paper: 500')
+    ap.add_argument('--pre-seg-ep', type=int, default=800, help='paper: 500')
     ap.add_argument('--pre-reg-ep', type=int, default=40, help='paper: 200')
     ap.add_argument('--seg-ep', type=int, default=30, help='paper: 100')
     ap.add_argument('--reg-ep', type=int, default=10, help='paper: 50')
@@ -101,6 +113,16 @@ def parse_args(argv=None):
                     help='segmentation loss: dice_ce = paper (foreground-only Dice + CE); '
                          'dice_ce_bg = Dice over both classes; dice_ce_boundary = adds the '
                          'boundary-weighted CE that penalizes bleeding across septa')
+    ap.add_argument('--lr-schedule', choices=('none', 'cosine', 'step'), default='none',
+                    help='learning-rate schedule for the SEGMENTATION stages. Default none '
+                         'reproduces the fixed learning rate of the published setup. The '
+                         'baseline runs oscillate: predicted foreground swings 0.45-0.63 '
+                         'between evaluations and model_final beat model_best on test, which '
+                         'is what annealing is meant to settle')
+    ap.add_argument('--lr-min', type=float, default=1e-6, help='cosine: final learning rate')
+    ap.add_argument('--lr-step-size', type=int, default=0,
+                    help='step: epochs between decays (0 = epochs // 4)')
+    ap.add_argument('--lr-gamma', type=float, default=0.5, help='step: decay factor')
     ap.add_argument('--boundary-w0', type=float, default=10.0, help='boundary weight height')
     ap.add_argument('--boundary-sigma', type=float, default=5.0,
                     help='boundary weight width in pixels (~ the gaps to keep open)')
@@ -112,6 +134,12 @@ def parse_args(argv=None):
                     help='disable the gamma/noise jitter that comes with --aug dihedral')
     ap.add_argument('--early-stop-patience', type=int, default=0,
                     help='stop pre-training after N evaluations without improvement (0 = off)')
+    ap.add_argument('--control-no-pseudo', action='store_true',
+                    help='CONTROL for the iterative stage: run the same number of iterations, '
+                         'the same epochs, learning rate and checkpoint chain, but train on the '
+                         'labeled source patches only. Separates "pseudo-labels hurt" from "the '
+                         'second training stage hurts". Skips assessment and the registration '
+                         'branch, neither of which influences the segmentation net in this mode.')
     ap.add_argument('--val-metric', choices=('dice_pooled', 'dice', 'loss'), default='dice_pooled',
                     help='what model_best.pt is selected on. The published setting is the '
                          'validation loss, but in the 400-epoch run the loss kept falling '
@@ -136,7 +164,12 @@ def parse_args(argv=None):
                     help='atlases/augmentations averaged per target in the assessment')
     ap.add_argument('--log-images', action='store_true',
                     help='write example images to tensorboard (slow: matplotlib per batch)')
-    ap.add_argument('--seed', type=int, default=123)
+    ap.add_argument('--seed', type=int, default=123,
+                    help='seeds python, numpy, torch and cuda; change it to get an '
+                         'independent repeat of the same configuration')
+    ap.add_argument('--no-deterministic', action='store_true',
+                    help='allow cudnn autotuning and non-deterministic kernels (faster, '
+                         'but repeats of the same seed will not match exactly)')
     args = ap.parse_args(argv)
     if args.quick:
         args.pre_seg_ep, args.pre_reg_ep = 2, 2
@@ -166,6 +199,24 @@ def build_seg_loss(name):
             LF.BoundarySeparationCrossEntropy(w0=args.boundary_w0,
                                               sigma=args.boundary_sigma): 0.5}
 
+
+# CHANGED: seed everything. Four runs of the identical recipe produced pooled test dice
+# of 0.7032, 0.7836, 0.7919 and 0.7963, because nothing seeded torch (weight init,
+# dropout, DataLoader shuffling) or the global numpy RNG that the augmentation draws
+# from. At that spread no cross-run comparison below ~0.1 dice means anything.
+def seed_everything(seed, deterministic=True):
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)          # A.RandomDihedral2D / IntensityJitter use this one
+    torch.manual_seed(seed)       # weight init, dropout, DataLoader shuffle
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        # same kernels every run; cudnn autotuning would otherwise pick different ones
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+seed_everything(args.seed, deterministic=not args.no_deterministic)
 
 T_START = time.time()   # CHANGED: was started after pre-training, so runtime read ~0
 RUN_ID = args.run_id or f"{os.path.basename(os.path.normpath(args.output_path))}-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -354,6 +405,30 @@ def probe_unlabeled(net, files, device, tag):
     return out
 
 
+def make_lr_schedule(optimizer, epochs, base_lr):
+    """Per-epoch learning-rate schedule for one segmentation stage, or None.
+
+    `Trainer.train` calls `.step()` once per epoch, so any torch scheduler with a
+    no-argument step works (ReduceLROnPlateau does not, and is deliberately not offered).
+
+    The learning rate is reset to `base_lr` and any `initial_lr` left in the parameter
+    groups by an earlier scheduler is dropped, so each stage, and each iteration of the
+    iterative stage, anneals from its configured learning rate rather than continuing the
+    decay of the previous one.
+    """
+    if args.lr_schedule == 'none':
+        return None
+    for group in optimizer.param_groups:
+        group['lr'] = base_lr
+        group.pop('initial_lr', None)
+    epochs = max(1, int(epochs))
+    if args.lr_schedule == 'cosine':
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=args.lr_min)
+    step = args.lr_step_size if args.lr_step_size > 0 else max(1, epochs // 4)
+    return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step, gamma=args.lr_gamma)
+
+
 def pick_device(choice):
     if choice == 'cuda' and not torch.cuda.is_available():
         raise SystemExit('--device cuda requested but torch.cuda.is_available() is False '
@@ -375,13 +450,13 @@ class cfg:
 
     test_only = args.test_only          # CHANGED: train by default
     test_pre_seg = True
-    test_pre_reg = args.iters > 0       # CHANGED: only when the loop needs registration
+    test_pre_reg = args.iters > 0 and not args.control_no_pseudo   # CHANGED
     test_seg = True
-    test_reg = args.iters > 0           # CHANGED
+    test_reg = args.iters > 0 and not args.control_no_pseudo       # CHANGED
 
     # pre_training parameters
     pre_train_seg = True
-    pre_train_reg = args.iters > 0      # CHANGED: no external pre_reg checkpoint exists
+    pre_train_reg = args.iters > 0 and not args.control_no_pseudo  # CHANGED
     pre_seg_ep = args.pre_seg_ep
     pre_seg_lr = 1e-4
     pre_seg_eval_frequency = max(1, args.pre_seg_ep // 20)   # CHANGED: scales with the schedule
@@ -402,8 +477,10 @@ class cfg:
     iters_start = 0
     iters = args.iters
     # CHANGED: with --iters 0 nothing needs the registration branch, so skip ~40 min of
-    # pre-training plus the 250-pair registration test.
-    use_reg = args.iters > 0
+    # pre-training plus the 250-pair registration test. Same in the control, where the
+    # segmentation net never sees a pseudo-label and so never depends on registration.
+    use_pseudo = not args.control_no_pseudo
+    use_reg = args.iters > 0 and use_pseudo
     threshold_dice = 0.9
     threshold_dice_min = 0.2
     num_assessment = args.num_assessment
@@ -436,6 +513,7 @@ class cfg:
     seg_log_validation_image = args.log_images
     reg_log_validation_image = args.log_images   # CHANGED: off by default (slow on CPU)
     save_frequency = None
+    lr_schedule = args.lr_schedule          # CHANGED: see make_lr_schedule
     # CHANGED: Trainer minimises this key, so an accuracy is selected through its
     # negation (see JointSegModel.eval_step).
     val_loss_key = {'loss': 'loss', 'dice': 'neg_dice',
@@ -521,8 +599,16 @@ print(f'  valid   {len(target_valid)}   test {len(target_test)}   '
       f'source_test {len(source_test)}   unlabeled_test {len(unlabeled_test)}')
 print(f'Training  loss={args.loss}  aug={args.aug}'
       + (f' (rate {args.aug_rate}, jitter {not args.no_jitter})' if args.aug != 'none' else '')
+      + f'  lr_schedule={args.lr_schedule}'
+      + (f' (lr {cfg.pre_seg_lr:g} -> {args.lr_min:g})' if args.lr_schedule == 'cosine' else '')
+      + (f' (x{args.lr_gamma} every {args.lr_step_size or cfg.pre_seg_ep // 4} ep)'
+         if args.lr_schedule == 'step' else '')
+      + f'  seed={args.seed}'
       + f'  pre_seg_ep={cfg.pre_seg_ep} seg_ep={cfg.seg_ep} iters={cfg.iters}'
-      + ('' if cfg.use_reg else '  [registration branch skipped: --iters 0]'))
+      + ('' if cfg.use_reg else
+         '  [registration branch skipped: '
+         + ('--control-no-pseudo' if not cfg.use_pseudo else '--iters 0') + ']')
+      + ('' if cfg.use_pseudo else '  [CONTROL: iterations train on source only]'))
 print(f'Run id    {RUN_ID}')
 
 dataset_info = {'data_path': cfg.data_path, 'source': len(source),
@@ -609,6 +695,8 @@ if not cfg.test_only :
             val_loss_key=cfg.val_loss_key,                       # CHANGED: cfg was unused
             early_stop_patience=cfg.early_stop_patience,         # CHANGED
             save_frequency=cfg.save_frequency,                   # CHANGED
+            learning_rate_schedule=make_lr_schedule(             # CHANGED: --lr-schedule
+                pre_opt_seg, cfg.pre_seg_ep, cfg.pre_seg_lr),
             print_tag=f'pre Seg - ')
     if cfg.pre_train_reg:
         pre_trainer_reg.cur_epoch = 0
@@ -644,6 +732,7 @@ if regions is None:
 
 summary = {'run_id': RUN_ID, 'args': vars(args), 'dataset': dataset_info,
            'device': str(device), 'val_metric': args.val_metric,
+           'seed': args.seed, 'deterministic': not args.no_deterministic,
            'started': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(T_START)),
            'metrics': {}}
 
@@ -734,15 +823,17 @@ for it_idx in range(cfg.iters_start, cfg.iters):
     it_path_reg = f'{it_output_path}/reg'
 
     # iter restore
-    if it_idx == 0:
-        it_target_list = glob.glob(f'{cfg.output_path}/assessed_data/good/*{cfg.img_suffix}')
-    else:
-        it_target_list = glob.glob(f'{cfg.output_path}/iter-{it_idx-1}/assessed_data/good/*{cfg.img_suffix}')
+    it_target_list = []
+    if cfg.use_pseudo:
+        src_dir = (cfg.output_path if it_idx == 0 else f'{cfg.output_path}/iter-{it_idx-1}')
+        it_target_list = glob.glob(f'{src_dir}/assessed_data/good/*{cfg.img_suffix}')
+    if it_idx > 0:
         trainer_seg.restore(f'{cfg.output_path}/iter-{it_idx-1}/seg/ckpt/model_best.pt')
-        trainer_reg.restore(f'{cfg.output_path}/iter-{it_idx-1}/reg/ckpt/model_final.pt')
+        if cfg.use_reg:
+            trainer_reg.restore(f'{cfg.output_path}/iter-{it_idx-1}/reg/ckpt/model_final.pt')
 
     # CHANGED: explain an empty pool instead of failing inside BaseDataset.
-    if not cfg.test_only and not it_target_list:
+    if not cfg.test_only and cfg.use_pseudo and not it_target_list:
         raise SystemExit(f'No pseudo-labeled targets for iteration {it_idx}. '
                          f'Expected files in {it_output_path}/../assessed_data/good.')
 
@@ -750,18 +841,21 @@ for it_idx in range(cfg.iters_start, cfg.iters):
     seg_train_list = source + it_target_list
     seg_train_set = SegRegDataset([], seg_train_list, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre, aug)   # CHANGED: augment here too
     seg_train_loader = DataLoader(seg_train_set, batch_size=cfg.train_batch_size, shuffle=True)
-    
-    reg_train_list = source + it_target_list
-    reg_target_list = reg_train_list.copy()
-    np.random.shuffle(reg_target_list)
-    reg_train_set = SegRegDataset(reg_train_list, reg_target_list, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre)
-    reg_train_loader = DataLoader(reg_train_set, batch_size=cfg.train_batch_size, shuffle=True)
+
+    reg_train_loader = None
+    if cfg.use_reg:
+        reg_train_list = source + it_target_list
+        reg_target_list = reg_train_list.copy()
+        np.random.shuffle(reg_target_list)
+        reg_train_set = SegRegDataset(reg_train_list, reg_target_list, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre)
+        reg_train_loader = DataLoader(reg_train_set, batch_size=cfg.train_batch_size, shuffle=True)
 
     valid_set = SegRegDataset(source, target_valid, cfg.source_key, cfg.target_key, [cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix], cfg.pre)
     valid_loader = DataLoader(valid_set, batch_size=cfg.eval_batch_size)
 
     if not cfg.test_only:
-        print(f'iter {it_idx}: {len(source)} labeled + {len(it_target_list)} pseudo-labeled patches')
+        print(f'iter {it_idx}: {len(source)} labeled + {len(it_target_list)} pseudo-labeled patches'
+              + ('   [CONTROL: no pseudo-labels]' if not cfg.use_pseudo else ''))
         trainer_seg.cur_epoch = 0
         trainer_seg.train(seg_train_loader, valid_loader, 
             epochs=cfg.seg_ep, 
@@ -771,21 +865,24 @@ for it_idx in range(cfg.iters_start, cfg.iters):
             eval_frequency=cfg.eval_frequency,
             val_loss_key=cfg.val_loss_key,                       # CHANGED
             save_frequency=cfg.save_frequency,                   # CHANGED
+            learning_rate_schedule=make_lr_schedule(             # CHANGED: fresh per iteration
+                opt_seg, cfg.seg_ep, cfg.seg_lr),
             print_tag=f'iter {it_idx} Seg - ')
         
-        trainer_reg.cur_epoch = 0
-        trainer_reg.train(reg_train_loader, valid_loader, 
-            epochs=cfg.reg_ep, 
-            output_path=it_path_reg, 
-            log_train_image=cfg.log_train_image, 
-            log_validation_image=cfg.reg_log_validation_image,
-            eval_frequency=cfg.eval_frequency,
-            print_tag=f'iter {it_idx} Reg - ')
+        if cfg.use_reg:   # CHANGED: skipped in the control and with --iters 0
+            trainer_reg.cur_epoch = 0
+            trainer_reg.train(reg_train_loader, valid_loader,
+                epochs=cfg.reg_ep,
+                output_path=it_path_reg,
+                log_train_image=cfg.log_train_image,
+                log_validation_image=cfg.reg_log_validation_image,
+                eval_frequency=cfg.eval_frequency,
+                print_tag=f'iter {it_idx} Reg - ')
 
-        # assessment
-        count_good = assessment.assessment(target_set, it_output_path+'/assessed_data', 
-                          cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix,
-                          [0,1], cfg.threshold_dice, cfg.threshold_dice_min, cfg.min_good * (it_idx+2), target_key=cfg.target_key)
+            # assessment
+            count_good = assessment.assessment(target_set, it_output_path+'/assessed_data',
+                              cfg.img_suffix, cfg.lab_suffix, cfg.weight_suffix,
+                              [0,1], cfg.threshold_dice, cfg.threshold_dice_min, cfg.min_good * (it_idx+2), target_key=cfg.target_key)
             
 
     # test seg
@@ -866,6 +963,9 @@ index_row = {
     'aug': args.aug,
     'aug_rate': args.aug_rate,
     'jitter': not args.no_jitter,
+    'lr_schedule': args.lr_schedule,
+    'lr_min': args.lr_min if args.lr_schedule == 'cosine' else '',
+    'lr_gamma': args.lr_gamma if args.lr_schedule == 'step' else '',
     'pre_seg_ep': cfg.pre_seg_ep,
     'seg_ep': cfg.seg_ep,
     'iters': cfg.iters,
@@ -889,18 +989,31 @@ index_row = {
     'test_block_dice_worst': (summary['metrics'].get('pre_seg_test_blocks') or [{}])[-1].get('dice_pooled', ''),
     'test_block_worst': (summary['metrics'].get('pre_seg_test_blocks') or [{}])[-1].get('block', ''),
     'val_metric': args.val_metric,
+    'seed': args.seed,
+    'deterministic': not args.no_deterministic,
+    'control_no_pseudo': args.control_no_pseudo,
     'unlab_pred_fg': flat_metric('pre_seg_unlabeled', 'pred_fg_mean'),
     'unlab_flip_consistency': flat_metric('pre_seg_unlabeled', 'flip_consistency_mean'),
     'unlab_confidence': flat_metric('pre_seg_unlabeled', 'confidence_mean'),
     'final_iter_dice_pooled': flat_metric(last_iter, 'dice_pooled') if last_iter else '',
 }
 if args.runs_index:
-    new_index = not os.path.isfile(args.runs_index)
-    with open(args.runs_index, 'a', newline='', encoding='utf-8') as fh:
-        w = csv.DictWriter(fh, list(index_row))
-        if new_index:
-            w.writeheader()
-        w.writerow({k: (f'{v:.4f}' if isinstance(v, float) else v) for k, v in index_row.items()})
+    # Reconcile the header instead of appending blindly: adding a column to index_row
+    # would otherwise write rows under an older, shorter header and silently misalign
+    # every value after the insertion point.
+    row = {k: (f'{v:.4f}' if isinstance(v, float) else v) for k, v in index_row.items()}
+    old_rows, old_fields = [], []
+    if os.path.isfile(args.runs_index):
+        with open(args.runs_index, newline='', encoding='utf-8') as fh:
+            reader = csv.DictReader(fh)
+            old_fields = list(reader.fieldnames or [])
+            old_rows = [dict(r) for r in reader]
+    fields = old_fields + [k for k in row if k not in old_fields]
+    with open(args.runs_index, 'w', newline='', encoding='utf-8') as fh:
+        w = csv.DictWriter(fh, fields, restval='')
+        w.writeheader()
+        for r in old_rows + [row]:
+            w.writerow({k: r.get(k, '') for k in fields})
 
 print(f'Done in {summary["minutes"]} min. Results in {cfg.output_path}')
 print(f'  final_test_results.txt   human-readable summary')
